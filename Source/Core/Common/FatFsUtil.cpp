@@ -487,8 +487,16 @@ static void SortFST(File::FSTEntry* root)
 
 bool SyncSDFolderToSDImage(const std::function<bool()>& cancelled, bool deterministic)
 {
-  const std::string source_dir = File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX);
-  const std::string image_path = File::GetUserPath(F_WIISDCARDIMAGE_IDX);
+  return SyncSDFolderToSDImage(File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX),
+                               File::GetUserPath(F_WIISDCARDIMAGE_IDX),
+                               Config::Get(Config::MAIN_WII_SD_CARD_FILESIZE), cancelled,
+                               deterministic);
+}
+
+bool SyncSDFolderToSDImage(const std::string& source_dir, const std::string& image_path,
+                           u64 configured_size, const std::function<bool()>& cancelled,
+                           bool deterministic)
+{
   if (source_dir.empty() || image_path.empty())
     return false;
 
@@ -507,7 +515,7 @@ bool SyncSDFolderToSDImage(const std::function<bool()>& cancelled, bool determin
   if (!CheckIfFATCompatible(root))
     return false;
 
-  u64 size = Config::Get(Config::MAIN_WII_SD_CARD_FILESIZE);
+  u64 size = configured_size;
   if (size == 0)
   {
     size = GetSize(root);
@@ -598,8 +606,40 @@ bool SyncSDFolderToSDImage(const std::function<bool()>& cancelled, bool determin
   return true;
 }
 
+// True when the host file at path already has exactly the bytes of the open image file src.
+// Leaves src's read position wherever the comparison stopped; callers must rewind.
+static bool FileContentsMatch(FIL* src, const std::string& path, std::vector<u8>& tmp_buffer)
+{
+  File::IOFile existing(path, "rb");
+  if (!existing || existing.GetSize() != f_size(src))
+    return false;
+
+  std::vector<u8> host_buffer(tmp_buffer.size());
+  u32 size = f_size(src);
+  while (size > 0)
+  {
+    const u32 chunk_size = std::min(size, static_cast<u32>(tmp_buffer.size()));
+    u32 read_size;
+    if (f_read(src, tmp_buffer.data(), chunk_size, &read_size) != FR_OK ||
+        read_size != chunk_size)
+    {
+      return false;
+    }
+    if (!existing.ReadBytes(host_buffer.data(), chunk_size))
+      return false;
+    if (std::memcmp(tmp_buffer.data(), host_buffer.data(), chunk_size) != 0)
+      return false;
+    size -= chunk_size;
+  }
+  return true;
+}
+
+// differential: write a file only when its bytes differ from what the target already holds,
+// and never delete anything. Used when the target is a real SD card (or any folder the user
+// owns), where the wholesale rewrite below would be destructive.
 static bool Unpack(const std::function<bool()>& cancelled, const std::string& path,
-                   bool is_directory, const char* name, std::vector<u8>& tmp_buffer)
+                   bool is_directory, const char* name, std::vector<u8>& tmp_buffer,
+                   bool differential)
 {
   if (cancelled())
     return false;
@@ -613,6 +653,23 @@ static bool Unpack(const std::function<bool()>& cancelled, const std::string& pa
       ERROR_LOG_FMT(COMMON, "Failed to open file {} in SD image: {}", path,
                     FatFsErrorToString(open_error_code));
       return false;
+    }
+
+    if (differential)
+    {
+      if (FileContentsMatch(&src, path, tmp_buffer))
+      {
+        f_close(&src);
+        return true;
+      }
+      const auto rewind_error_code = f_lseek(&src, 0);
+      if (rewind_error_code != FR_OK)
+      {
+        ERROR_LOG_FMT(COMMON, "Failed to rewind file {} in SD image: {}", path,
+                      FatFsErrorToString(rewind_error_code));
+        return false;
+      }
+      INFO_LOG_FMT(COMMON, "SD sync: updating changed file {}", path);
     }
 
     File::IOFile dst(path, "wb");
@@ -671,7 +728,9 @@ static bool Unpack(const std::function<bool()>& cancelled, const std::string& pa
     return true;
   }
 
-  if (!File::CreateDir(path))
+  // In differential mode the directory usually exists already (it may even be a drive root,
+  // which cannot be created); creating is only for the non-differential rebuild.
+  if (!File::IsDirectory(path) && !File::CreateDir(path))
   {
     ERROR_LOG_FMT(COMMON, "Failed to create directory {}", path);
     return false;
@@ -731,7 +790,7 @@ static bool Unpack(const std::function<bool()>& cancelled, const std::string& pa
     }
 
     if (!Unpack(cancelled, fmt::format("{}/{}", path, childname), entry.fattrib & AM_DIR,
-                entry.fname, tmp_buffer))
+                entry.fname, tmp_buffer, differential))
     {
       return false;
     }
@@ -758,8 +817,14 @@ static bool Unpack(const std::function<bool()>& cancelled, const std::string& pa
 
 bool SyncSDImageToSDFolder(const std::function<bool()>& cancelled)
 {
-  const std::string image_path = File::GetUserPath(F_WIISDCARDIMAGE_IDX);
-  const std::string target_dir = File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX);
+  return SyncSDImageToSDFolder(File::GetUserPath(F_WIISDCARDIMAGE_IDX),
+                               File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX), cancelled,
+                               /*differential=*/false);
+}
+
+bool SyncSDImageToSDFolder(const std::string& image_path, const std::string& target_dir,
+                           const std::function<bool()>& cancelled, bool differential)
+{
   if (image_path.empty() || target_dir.empty())
     return false;
 
@@ -795,37 +860,60 @@ bool SyncSDImageToSDFolder(const std::function<bool()>& cancelled)
   Common::ScopeGuard unmount_guard{[] { f_unmount(""); }};
 
   // Unpack() and GetTempFilenameForAtomicWrite() don't want the trailing separator.
-  const std::string target_dir_without_slash = target_dir.substr(0, target_dir.length() - 1);
-
-  // Most systems don't offer atomic directory renaming, so it's simpler to directly work on the
-  // actual one and rollback if needed.
-  const bool target_dir_exists = File::IsDirectory(target_dir);
-  const std::string backup_target_dir_without_slash =
-      File::GetTempFilenameForAtomicWrite(target_dir_without_slash);
-
-  if (target_dir_exists)
+  std::string target_dir_without_slash = target_dir;
+  while (!target_dir_without_slash.empty() &&
+         (target_dir_without_slash.back() == '/' || target_dir_without_slash.back() == '\\'))
   {
-    if (!File::Rename(target_dir_without_slash, backup_target_dir_without_slash))
+    target_dir_without_slash.pop_back();
+  }
+
+  if (differential)
+  {
+    // Touch the target as little as possible: write only files whose content changed and
+    // never move or delete anything. The target may be a real SD card (or a drive root,
+    // where the rename dance below is impossible), so a failed sync must leave it as-is.
+    std::vector<u8> tmp_buffer(MAX_CLUSTER_SIZE);
+    if (!Unpack(cancelled, target_dir_without_slash, true, "", tmp_buffer, true))
     {
-      ERROR_LOG_FMT(COMMON, "Failed to move old SD folder to {}", backup_target_dir_without_slash);
+      ERROR_LOG_FMT(COMMON, "Failed to sync SD image {} into {}", image_path, target_dir);
       return false;
     }
-  }
 
-  std::vector<u8> tmp_buffer(MAX_CLUSTER_SIZE);
-  if (!Unpack(cancelled, target_dir_without_slash, true, "", tmp_buffer))
+    unmount_guard.Exit();  // unmount before closing the image
+  }
+  else
   {
-    ERROR_LOG_FMT(COMMON, "Failed to unpack SD image {} to {}", image_path, target_dir);
-    File::DeleteDirRecursively(target_dir_without_slash);
+    // Most systems don't offer atomic directory renaming, so it's simpler to directly work on
+    // the actual one and rollback if needed.
+    const bool target_dir_exists = File::IsDirectory(target_dir);
+    const std::string backup_target_dir_without_slash =
+        File::GetTempFilenameForAtomicWrite(target_dir_without_slash);
+
     if (target_dir_exists)
-      File::Rename(backup_target_dir_without_slash, target_dir_without_slash);
-    return false;
+    {
+      if (!File::Rename(target_dir_without_slash, backup_target_dir_without_slash))
+      {
+        ERROR_LOG_FMT(COMMON, "Failed to move old SD folder to {}",
+                      backup_target_dir_without_slash);
+        return false;
+      }
+    }
+
+    std::vector<u8> tmp_buffer(MAX_CLUSTER_SIZE);
+    if (!Unpack(cancelled, target_dir_without_slash, true, "", tmp_buffer, false))
+    {
+      ERROR_LOG_FMT(COMMON, "Failed to unpack SD image {} to {}", image_path, target_dir);
+      File::DeleteDirRecursively(target_dir_without_slash);
+      if (target_dir_exists)
+        File::Rename(backup_target_dir_without_slash, target_dir_without_slash);
+      return false;
+    }
+
+    unmount_guard.Exit();  // unmount before closing the image
+
+    if (target_dir_exists)
+      File::DeleteDirRecursively(backup_target_dir_without_slash);
   }
-
-  unmount_guard.Exit();  // unmount before closing the image
-
-  if (target_dir_exists)
-    File::DeleteDirRecursively(backup_target_dir_without_slash);
 
   // even if this fails the conversion has already succeeded, so we still return true
   if (!image.Close())
